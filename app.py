@@ -165,8 +165,8 @@ def _base_url() -> str:
     base = request.url_root.rstrip("/")
     if "localhost" not in base and "127.0.0.1" not in base:
         base = base.replace("http://", "https://", 1)
-        if not '.baby-beamup.club' in base:
-            base = base + '.baby-beamup.club'
+        #if not '.baby-beamup.club' in base:
+        #    base = base + '.baby-beamup.club'
     return base
 
 
