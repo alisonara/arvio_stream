@@ -1,0 +1,7 @@
+flask>=3.0
+flask-cors>=4.0
+telethon>=1.36
+cryptography>=42.0
+requests>=2.31
+cryptg>=0.4.0
+gunicorn>=21.2

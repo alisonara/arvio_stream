@@ -1,0 +1,3 @@
+Arvio compatibility shim for the vendored qrcode 8.2 source.
+Postponed annotations are enabled and runtime PEP-585 type aliases are removed
+so the pure-Python QR path used by Arvio remains importable on Python 3.8.

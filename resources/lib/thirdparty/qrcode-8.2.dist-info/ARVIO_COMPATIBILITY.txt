@@ -1,0 +1,7 @@
+ARVIO vendored-use compatibility note
+
+The bundled qrcode 8.2 upstream metadata requires Python >=3.9.
+Arvio Stream uses only the pure-Python PNG QR path. That path is statically
+audited against Python 3.8 grammar/common post-3.8 APIs and has a text fallback
+if QR import/rendering is unavailable. This is not a claim of upstream Python
+3.8 support. Strict upstream-supported QR operation is expected on Python 3.9+.
