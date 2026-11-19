@@ -667,6 +667,11 @@ def _video_from_msg(msg, desc: dict) -> dict | None:
     name = _file_name(doc).strip()
     lower_name = name.lower()
     ext_ok = lower_name.endswith(VIDEO_EXTENSIONS)
+    caption = getattr(msg, "message", "") or ""
+    caption_ext = next((
+        ext for ext in VIDEO_EXTENSIONS
+        if re.search(re.escape(ext) + r"(?=$|[\s)\]}>,;])", caption.lower())
+    ), "")
 
     attrs = getattr(doc, "attributes", []) or []
     has_video_attribute = any(
@@ -676,12 +681,14 @@ def _video_from_msg(msg, desc: dict) -> dict | None:
     # Muitos grupos enviam vídeos como "application/octet-stream", ou sem
     # nome de arquivo. Atributo de vídeo do Telegram também é um sinal válido.
     if not (mime.startswith("video/") or mime == "application/x-matroska"
-            or ext_ok or has_video_attribute):
+            or ext_ok or caption_ext or has_video_attribute):
         return None
 
     if not name:
-        ext = MIME_VIDEO_EXTENSIONS.get(mime, ".mp4")
+        ext = caption_ext or MIME_VIDEO_EXTENSIONS.get(mime, ".mp4")
         name = f"video_{getattr(msg, 'id', 'telegram')}{ext}"
+    if mime in ("", "application/octet-stream"):
+        mime = mimetypes.guess_type(name)[0] or mime
 
     size = int(getattr(doc, "size", 0) or 0)
     return {
@@ -690,7 +697,7 @@ def _video_from_msg(msg, desc: dict) -> dict | None:
         "size": size,
         "mime": mime or mimetypes.guess_type(name)[0] or "video/mp4",
         "duration": _duration(doc),
-        "caption": getattr(msg, "message", "") or "",
+        "caption": caption,
         "peerId": desc.get("peerId", ""),
         "peerType": desc.get("peerType", ""),
         "peerRawId": desc.get("peerRawId", ""),
@@ -1061,9 +1068,14 @@ async def _search_async(session: str, queries: list[str], imdb_id: str,
             queries[0] if queries else "",
         )
         tokens = _tokens(title_query)
+        # A busca do Telegram pode não localizar mensagens pelo atributo de
+        # nome do documento quando ele foi enviado sem legenda. Com fontes
+        # escolhidas, inspeciona os nomes recentes em toda busca de episódio,
+        # mesmo que já tenha encontrado outra cópia. Sem seleção explícita,
+        # mantém a varredura como fallback para evitar percorrer todos os chats.
         if tokens and (
-            len(all_results) < 20
-            or (season_no is not None and not exact_episode_found())
+            (season_no is not None and selected_sources is not None)
+            or len(all_results) < 20
         ):
             found = await _search_by_filename(client, tokens, scope)
             absorb(found, title_query)
