@@ -302,6 +302,35 @@ def _matches_requested_episode(video: dict, season_no: int, episode_no: int) -> 
     return bool(re.search(rf"(?<![a-z0-9])0*{episode_no}(?![0-9])", norm))
 
 
+def _matches_requested_title(video: dict, aliases: list[str]) -> bool:
+    """Exige evidência do título para não misturar séries com mesmo SxxEyy."""
+    if not aliases:
+        return True
+    text = f"{video.get('fileName', '')} {video.get('caption', '')}"
+    norm = _normalize_match_text(text)
+    blob_tokens = set(_tokens(text))
+    compact_blob = re.sub(r"[^a-z0-9]", "", norm)
+    stopwords = {
+        "the", "a", "an", "and", "of", "to", "la", "el", "los", "las",
+        "as", "os", "de", "da", "do", "dos", "das", "e",
+    }
+
+    for alias in aliases:
+        alias_norm = _normalize_match_text(alias)
+        alias_tokens = [token for token in _tokens(alias) if token not in stopwords]
+        if not alias_tokens:
+            continue
+        if all(token in blob_tokens for token in alias_tokens):
+            return True
+
+        # Permite a sigla mesmo quando o arquivo usa pontos entre as letras.
+        if len(alias_tokens) >= 3:
+            acronym = "".join(token[0] for token in alias_tokens)
+            if len(acronym) >= 3 and acronym in compact_blob:
+                return True
+    return False
+
+
 
 @_app.route("/stream/<content_type>/<content_id>.json")
 def streams_json(content_type: str, content_id: str):
@@ -392,6 +421,7 @@ def streams_json(content_type: str, content_id: str):
                 videos = [
                     video for video in videos
                     if _matches_requested_episode(video, season_no, episode_no)
+                    and _matches_requested_title(video, aliases)
                 ]
             except (TypeError, ValueError):
                 pass
@@ -400,7 +430,17 @@ def streams_json(content_type: str, content_id: str):
         return jsonify({"streams": [], "error": str(e)}), 500
 
     streams = []
+    seen_files = set()
     for v in videos:
+        # Uma cópia repostada em vários grupos não precisa aparecer várias
+        # vezes na mesma lista do Stremio.
+        file_key = (
+            _normalize_match_text(v.get("fileName", "")),
+            int(v.get("size") or 0),
+        )
+        if file_key in seen_files:
+            continue
+        seen_files.add(file_key)
         play_payload = {
             "s": session,
             "p": v["peerId"],
