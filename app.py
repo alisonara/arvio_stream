@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import difflib
 import hashlib
 import json
 import math
+import mimetypes
 import os
 import re
 import sys
+import unicodedata
 import threading
 import time
 import urllib.parse
@@ -77,7 +80,11 @@ if _TELETHON_OK:
 # ---------- Credenciais ----------
 TELEGRAM_API_ID = int(os.environ.get("TELEGRAM_API_ID", 0))
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
-TELEGRAM_SEARCH_TIMEOUT_S = 20
+TELEGRAM_SEARCH_TIMEOUT_S = int(os.environ.get("ARVIO_SEARCH_TIMEOUT", 45))
+ARVIO_GLOBAL_SEARCH_LIMIT = int(os.environ.get("ARVIO_GLOBAL_SEARCH_LIMIT", 50))
+ARVIO_DIALOG_SEARCH_LIMIT = int(os.environ.get("ARVIO_DIALOG_SEARCH_LIMIT", 40))
+ARVIO_HISTORY_SCAN_LIMIT = int(os.environ.get("ARVIO_HISTORY_SCAN_LIMIT", 350))
+ARVIO_MAX_RESULTS = int(os.environ.get("ARVIO_MAX_RESULTS", 30))
 
 MT_CHUNK = 256 * 1024
 PIPELINE_DEPTH = 3
@@ -124,9 +131,13 @@ def _decrypt(token: str | None) -> dict | None:
         return None
 
 
+def _token_data(token: str | None) -> dict | None:
+    return _decrypt(token) if token else None
+
+
 def _session_from(token: str | None) -> str | None:
-    d = _decrypt(token) if token else None
-    return d.get("s") if d else None
+    data = _token_data(token)
+    return data.get("s") if data else None
 
 
 def _token_for(session: str, extra: dict | None = None) -> str:
@@ -263,7 +274,8 @@ def manifest():
 @_app.route("/stream/<content_type>/<content_id>.json")
 def streams_json(content_type: str, content_id: str):
     token = request.args.get("token")
-    session = _session_from(token)
+    token_data = _token_data(token)
+    session = token_data.get("s") if token_data else None
     if not session:
         return jsonify({"streams": [], "error": "not_connected"}), 401
     if content_type not in ("movie", "series"):
@@ -277,20 +289,43 @@ def streams_json(content_type: str, content_id: str):
     title = (meta or {}).get("name") or ""
     year = (meta or {}).get("year") or ""
     alt = (meta or {}).get("originalName") or ""
-    aliases = list({title, alt} - {""})
+    aliases = list(dict.fromkeys(x for x in (title, alt) if x))
 
     queries = []
     for t in aliases:
         if year:
             queries.append(f"{t} {year}")
-        queries.append(t)
-        queries.append(t.replace(" ", "."))
+        queries.extend((t, t.replace(" ", ".")))
+
+    # O Stremio costuma enviar séries como tt123456:temporada:episódio.
+    # Acrescentar padrões comuns ajuda a localizar arquivos cujo nome não
+    # contém o título completo, mas contém SxxEyy ou 1x02.
+    episode_parts = content_id.split(":")
+    if content_type == "series" and len(episode_parts) >= 3:
+        try:
+            season_no, episode_no = int(episode_parts[1]), int(episode_parts[2])
+            if 0 <= season_no <= 99 and 0 <= episode_no <= 999:
+                queries.extend((
+                    f"S{season_no:02d}E{episode_no:02d}",
+                    f"S{season_no}E{episode_no}",
+                    f"{season_no}x{episode_no:02d}",
+                ))
+        except (TypeError, ValueError):
+            pass
+
     queries = [q for q in dict.fromkeys(queries) if q.strip()]
     if not queries:
         queries = [imdb_id]
 
+    # Token antigo sem a chave "sources" continua pesquisando em todos os
+    # diálogos. Depois que o usuário salva uma seleção, só esses IDs entram.
+    selected_sources = token_data.get("sources") if "sources" in token_data else None
+
     try:
-        videos = _search_telegram_multi(session, queries, imdb_id=imdb_id)
+        videos = _search_telegram_multi(
+            session, queries, imdb_id=imdb_id,
+            selected_sources=selected_sources,
+        )
     except Exception as e:
         print(f"[arvio] busca falhou: {e}")
         return jsonify({"streams": [], "error": str(e)}), 500
@@ -466,6 +501,29 @@ def _peer_desc(entity) -> dict:
     }
 
 
+VIDEO_EXTENSIONS = (
+    ".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts",
+    ".m2ts", ".mts", ".mpg", ".mpeg", ".mpe", ".vob", ".wmv",
+    ".flv", ".3gp", ".ogv", ".ogg", ".f4v", ".divx", ".mxf",
+    ".asf", ".rm", ".rmvb", ".dv", ".mpv", ".m2v",
+)
+
+MIME_VIDEO_EXTENSIONS = {
+    "video/mp4": ".mp4",
+    "video/x-matroska": ".mkv",
+    "application/x-matroska": ".mkv",
+    "video/webm": ".webm",
+    "video/x-msvideo": ".avi",
+    "video/quicktime": ".mov",
+    "video/mpeg": ".mpg",
+    "video/mp2t": ".ts",
+    "video/x-ms-wmv": ".wmv",
+    "video/x-flv": ".flv",
+    "video/3gpp": ".3gp",
+    "video/ogg": ".ogv",
+}
+
+
 def _video_from_msg(msg, desc: dict) -> dict | None:
     media = getattr(msg, "media", None)
     if not isinstance(media, MessageMediaDocument):
@@ -473,21 +531,35 @@ def _video_from_msg(msg, desc: dict) -> dict | None:
     doc = media.document
     if not isinstance(doc, Document):
         return None
-    mime = (doc.mime_type or "").lower()
-    name = _file_name(doc)
-    ext_ok = name.lower().endswith(
-        (".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts")
-    )
-    if not (mime.startswith("video/") or mime == "application/x-matroska" or ext_ok):
+
+    mime = (getattr(doc, "mime_type", None) or "").lower().strip()
+    name = _file_name(doc).strip()
+    lower_name = name.lower()
+    ext_ok = lower_name.endswith(VIDEO_EXTENSIONS)
+
+    attrs = getattr(doc, "attributes", []) or []
+    has_video_attribute = any(
+        isinstance(a, DocumentAttributeVideo) for a in attrs
+    ) if DocumentAttributeVideo else False
+
+    # Muitos grupos enviam vídeos como "application/octet-stream", ou sem
+    # nome de arquivo. Atributo de vídeo do Telegram também é um sinal válido.
+    if not (mime.startswith("video/") or mime == "application/x-matroska"
+            or ext_ok or has_video_attribute):
         return None
-    name = name or "video.mp4"
+
+    if not name:
+        ext = MIME_VIDEO_EXTENSIONS.get(mime, ".mp4")
+        name = f"video_{getattr(msg, 'id', 'telegram')}{ext}"
+
+    size = int(getattr(doc, "size", 0) or 0)
     return {
-        "key": f"{desc.get('peerId')}|{msg.id}|{name}|{doc.size or 0}",
+        "key": f"{desc.get('peerId')}|{msg.id}|{getattr(doc, 'id', 0)}|{size}",
         "fileName": name,
-        "size": int(doc.size or 0),
-        "mime": mime or "video/mp4",
+        "size": size,
+        "mime": mime or mimetypes.guess_type(name)[0] or "video/mp4",
         "duration": _duration(doc),
-        "caption": msg.message or "",
+        "caption": getattr(msg, "message", "") or "",
         "peerId": desc.get("peerId", ""),
         "peerType": desc.get("peerType", ""),
         "peerRawId": desc.get("peerRawId", ""),
@@ -500,52 +572,140 @@ def _video_from_msg(msg, desc: dict) -> dict | None:
     }
 
 
+def _normalize_match_text(value: str) -> str:
+    value = unicodedata.normalize("NFKD", str(value or ""))
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = value.lower()
+    # Pontuação, separadores e nomes no padrão release passam a ser espaços.
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
 def _tokens(text: str) -> list[str]:
-    norm = re.sub(r"[^\w\s]", " ", str(text or "").lower(), flags=re.UNICODE)
-    return [t for t in norm.split() if len(t) >= 2]
+    return [t for t in _normalize_match_text(text).split() if len(t) >= 2]
 
 
 def _score(video: dict, query: str, imdb_id: str) -> int:
-    blob = f"{video.get('fileName','')} {video.get('caption','')}".lower()
-    q = query.lower()
-    q_tokens = _tokens(q)
-    blob_tokens = set(_tokens(blob))
+    filename = video.get("fileName", "")
+    caption = video.get("caption", "")
+    blob_raw = f"{filename} {caption}"
+    blob = _normalize_match_text(blob_raw)
+    q = _normalize_match_text(query)
+    q_tokens = _tokens(query)
+    blob_tokens = set(_tokens(blob_raw))
+
+    if not q_tokens:
+        return 0
+    # Termos isolados de episódio são usados para ampliar a busca no Telegram,
+    # mas não podem pontuar sozinhos: S01E02 existe em inúmeras séries.
+    if re.fullmatch(r"(?:s\d{1,2}e\d{1,3}|\d{1,2}x\d{1,3})", q):
+        return 0
+
     score = 0
     if imdb_id and imdb_id.lower() in blob:
-        score += 100
-    if q in blob:
+        score += 120
+    if q and q in blob:
+        score += 45
+
+    hits = sum(1 for token in q_tokens if token in blob_tokens)
+    coverage = hits / max(1, len(q_tokens))
+    if hits == len(q_tokens):
         score += 40
-    if q_tokens and all(t in blob_tokens for t in q_tokens):
-        score += 30
-    if q_tokens:
-        hits = sum(1 for t in q_tokens if t in blob_tokens)
-        score += int(20 * hits / max(1, len(q_tokens)))
-    years = re.findall(r"(19|20)\d{2}", q)
-    if years and any(y in blob for y in years):
-        score += 10
-    if video.get("size", 0) > 100 * 1024 * 1024:
-        score += 5
+    score += int(35 * coverage)
+
+    # Correspondência aproximada para títulos com abreviações, pontuação
+    # diferente ou pequenos erros de digitação. Exige semelhança alta.
+    title_query = " ".join(t for t in q_tokens if not re.fullmatch(r"(19|20)\d{2}", t))
+    title_blob = _normalize_match_text(filename)
+    if title_query and title_blob:
+        ratio = difflib.SequenceMatcher(None, title_query, title_blob).ratio()
+        if ratio >= 0.72:
+            score += int(25 * ratio)
+
+    years = re.findall(r"\b(?:19|20)\d{2}\b", q)
+    if years and any(year in blob for year in years):
+        score += 12
+
+    # Reforço de padrões de temporada/episódio (S01E02, 1x02).
+    episode_patterns = re.findall(r"\bs\d{1,2}\s*e\d{1,3}\b|\b\d{1,2}x\d{1,3}\b", q)
+    if episode_patterns and any(
+        re.sub(r"\s+", "", pat) in re.sub(r"\s+", "", blob)
+        for pat in episode_patterns
+    ):
+        score += 35
+
+    if video.get("duration", 0) > 0:
+        score += 2
     return score
 
 
 async def _joined_scope(client) -> dict:
+    """Lista grupos, supergrupos e canais aos quais a conta tem acesso."""
     scope = {}
     try:
-        async for d in client.iter_dialogs(limit=None):
-            e = getattr(d, "entity", None)
-            if e is None or getattr(e, "deleted", False) or getattr(e, "left", False):
+        async for dialog in client.iter_dialogs(limit=None):
+            entity = getattr(dialog, "entity", None)
+            if (entity is None or getattr(entity, "deleted", False)
+                    or getattr(entity, "left", False)):
                 continue
-            if not isinstance(e, (types.Channel, types.Chat)):
+            if not isinstance(entity, (types.Channel, types.Chat)):
                 continue
-            desc = _peer_desc(e)
-            if desc.get("peerId"):
-                scope[desc["peerId"]] = {"entity": e, "desc": desc}
+
+            desc = _peer_desc(entity)
+            peer_id = desc.get("peerId")
+            if not peer_id:
+                continue
+
+            if isinstance(entity, types.Chat):
+                kind = "grupo"
+            elif getattr(entity, "broadcast", False):
+                kind = "canal"
+            else:
+                kind = "supergrupo"
+
+            title = (
+                getattr(dialog, "title", None)
+                or getattr(entity, "title", None)
+                or f"Telegram {peer_id}"
+            )
+            scope[peer_id] = {
+                "entity": entity,
+                "desc": desc,
+                "title": str(title),
+                "username": getattr(entity, "username", None) or "",
+                "kind": kind,
+            }
     except Exception as exc:
         print(f"[arvio] scope: {exc}")
     return scope
 
 
-async def _search_global(client, query: str, scope: dict, limit: int = 20) -> list[dict]:
+async def _list_sources_async(session: str) -> list[dict]:
+    client = _new_client(session)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Sessão expirada. Reconecte em /configure.")
+        scope = await _joined_scope(client)
+        sources = []
+        for peer_id, entry in scope.items():
+            sources.append({
+                "id": peer_id,
+                "title": entry.get("title") or "Sem título",
+                "type": entry.get("kind") or "grupo",
+                "username": entry.get("username") or "",
+            })
+        sources.sort(key=lambda item: (item["title"] or "").casefold())
+        return sources
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+async def _search_global(client, query: str, scope: dict,
+                         limit: int = ARVIO_GLOBAL_SEARCH_LIMIT) -> list[dict]:
     if not scope or not query.strip():
         return []
 
@@ -566,10 +726,10 @@ async def _search_global(client, query: str, scope: dict, limit: int = 20) -> li
         return_exceptions=True,
     )
     seen, out = set(), []
-    for r in results:
-        if not r or isinstance(r, BaseException):
+    for result in results:
+        if not result or isinstance(result, BaseException):
             continue
-        for msg in getattr(r, "messages", []) or []:
+        for msg in getattr(result, "messages", []) or []:
             try:
                 signed = str(utils.get_peer_id(msg.peer_id))
             except Exception:
@@ -577,61 +737,20 @@ async def _search_global(client, query: str, scope: dict, limit: int = 20) -> li
             entry = scope.get(signed)
             if not entry:
                 continue
-            v = _video_from_msg(msg, entry["desc"])
-            if v and v["key"] not in seen:
-                seen.add(v["key"])
-                out.append(v)
+            video = _video_from_msg(msg, entry["desc"])
+            if video and video["key"] not in seen:
+                seen.add(video["key"])
+                out.append(video)
     return out
 
 
-async def _search_per_dialog(client, query: str, scope: dict, limit: int = 20) -> list[dict]:
+async def _search_per_dialog(client, query: str, scope: dict,
+                             limit: int = ARVIO_DIALOG_SEARCH_LIMIT) -> list[dict]:
     if not scope:
-        return []
-    sem = asyncio.Semaphore(5)
-    out: list[dict] = []
-    seen = set()
-
-    async def scan(entry):
-        entity = entry.get("entity")
-        if entity is None:
-            return []
-        local = []
-        try:
-            async with sem:
-                async for msg in client.iter_messages(entity, search=query, limit=15):
-                    v = _video_from_msg(msg, entry["desc"])
-                    if v:
-                        local.append(v)
-        except Exception:
-            pass
-        return local
-
-    tasks = [asyncio.ensure_future(scan(e)) for e in scope.values()]
-    try:
-        for fut in asyncio.as_completed(tasks):
-            try:
-                found = await fut
-            except Exception:
-                found = []
-            for v in found:
-                if v["key"] not in seen:
-                    seen.add(v["key"])
-                    out.append(v)
-    finally:
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-    return out[:limit]
-
-
-async def _search_by_filename(client, tokens: list[str], scope: dict, limit: int = 30) -> list[dict]:
-    if not scope or not tokens:
         return []
     sem = asyncio.Semaphore(4)
     out: list[dict] = []
     seen = set()
-    key_tokens = [t for t in tokens if len(t) >= 3][:6]
 
     async def scan(entry):
         entity = entry.get("entity")
@@ -641,89 +760,165 @@ async def _search_by_filename(client, tokens: list[str], scope: dict, limit: int
         try:
             async with sem:
                 async for msg in client.iter_messages(
-                    entity, limit=200, filter=InputMessagesFilterVideo()
+                    entity, search=query, limit=limit
                 ):
-                    v = _video_from_msg(msg, entry["desc"])
-                    if not v:
-                        continue
-                    blob = f"{v['fileName']} {v.get('caption','')}".lower()
-                    hits = sum(1 for t in key_tokens if t in blob)
-                    if hits >= max(1, len(key_tokens) - 1):
-                        local.append(v)
-                        if len(local) >= 8:
-                            break
-        except Exception:
-            pass
+                    video = _video_from_msg(msg, entry["desc"])
+                    if video:
+                        local.append(video)
+        except Exception as exc:
+            print(f"[arvio] busca local ignorada em {entry.get('title')}: {exc}")
         return local
 
-    tasks = [asyncio.ensure_future(scan(e)) for e in scope.values()]
+    tasks = [asyncio.ensure_future(scan(entry)) for entry in scope.values()]
     try:
-        for fut in asyncio.as_completed(tasks):
+        for future in asyncio.as_completed(tasks):
             try:
-                found = await fut
+                found = await future
             except Exception:
                 found = []
-            for v in found:
-                if v["key"] not in seen:
-                    seen.add(v["key"])
-                    out.append(v)
-                    if len(out) >= limit:
-                        return out
+            for video in found:
+                if video["key"] not in seen:
+                    seen.add(video["key"])
+                    out.append(video)
+                    if len(out) >= limit * 4:
+                        break
     finally:
-        for t in tasks:
-            if not t.done():
-                t.cancel()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
     return out
 
 
-async def _search_async(session: str, queries: list[str], imdb_id: str) -> list[dict]:
+async def _search_by_filename(client, tokens: list[str], scope: dict,
+                              limit: int = 45) -> list[dict]:
+    if not scope or not tokens:
+        return []
+    sem = asyncio.Semaphore(3)
+    out: list[dict] = []
+    seen = set()
+    key_tokens = [t for t in tokens if len(t) >= 3][:7]
+
+    async def scan(entry):
+        entity = entry.get("entity")
+        if entity is None:
+            return []
+        local = []
+        try:
+            async with sem:
+                # DocumentFilter inclui arquivos enviados como documento, não
+                # apenas vídeos enviados com a opção "Enviar como vídeo".
+                async for msg in client.iter_messages(
+                    entity, limit=ARVIO_HISTORY_SCAN_LIMIT,
+                ):
+                    video = _video_from_msg(msg, entry["desc"])
+                    if not video:
+                        continue
+                    haystack = set(_tokens(
+                        f"{video['fileName']} {video.get('caption', '')}"
+                    ))
+                    hits = sum(1 for token in key_tokens if token in haystack)
+                    if hits >= max(1, min(2, len(key_tokens))):
+                        local.append(video)
+                        if len(local) >= 8:
+                            break
+        except Exception as exc:
+            print(f"[arvio] varredura de histórico ignorada em {entry.get('title')}: {exc}")
+        return local
+
+    tasks = [asyncio.ensure_future(scan(entry)) for entry in scope.values()]
+    try:
+        for future in asyncio.as_completed(tasks):
+            try:
+                found = await future
+            except Exception:
+                found = []
+            for video in found:
+                if video["key"] not in seen:
+                    seen.add(video["key"])
+                    out.append(video)
+                    if len(out) >= limit:
+                        return out
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return out
+
+
+async def _search_async(session: str, queries: list[str], imdb_id: str,
+                        selected_sources: list[str] | None = None) -> list[dict]:
     client = _new_client(session)
     try:
         await client.connect()
         if not await client.is_user_authorized():
             raise RuntimeError("Sessão expirada. Reconecte em /configure.")
+
         scope = await _joined_scope(client)
-        print(f"[arvio] escopo: {len(scope)} canal(is)")
+        if selected_sources is not None:
+            selected_ids = {str(value) for value in selected_sources}
+            scope = {
+                peer_id: entry for peer_id, entry in scope.items()
+                if peer_id in selected_ids
+            }
+
+        print(f"[arvio] escopo de busca: {len(scope)} grupo(s)/canal(is)")
+        if not scope:
+            return []
 
         all_results: dict[str, dict] = {}
         scores: dict[str, int] = {}
 
         def absorb(videos: list[dict], query: str):
-            for v in videos:
-                k = v["key"]
-                if k not in all_results:
-                    all_results[k] = v
-                    scores[k] = 0
-                scores[k] = max(scores[k], _score(v, query, imdb_id))
+            for video in videos:
+                key = video["key"]
+                if key not in all_results:
+                    all_results[key] = video
+                    scores[key] = 0
+                scores[key] = max(scores[key], _score(video, query, imdb_id))
 
-        for q in queries[:4]:
-            found = await _search_global(client, q, scope)
-            absorb(found, q)
+        # Pesquisa global do Telegram primeiro; depois busca local em cada
+        # fonte selecionada, e por fim varre o histórico recente de documentos.
+        for query in queries[:6]:
+            found = await _search_global(client, query, scope)
+            absorb(found, query)
 
-        if len(all_results) < 5:
-            for q in queries[:3]:
-                found = await _search_per_dialog(client, q, scope)
-                absorb(found, q)
+        if len(all_results) < 8:
+            for query in queries[:4]:
+                found = await _search_per_dialog(client, query, scope)
+                absorb(found, query)
 
-        tokens = _tokens(queries[0] if queries else "")
-        if tokens:
+        title_query = next(
+            (query for query in queries if query and not re.fullmatch(
+                r"S\d{1,2}E\d{1,3}|\d{1,2}x\d{1,3}", query, re.I
+            )),
+            queries[0] if queries else "",
+        )
+        tokens = _tokens(title_query)
+        if tokens and len(all_results) < 20:
             found = await _search_by_filename(client, tokens, scope)
-            absorb(found, queries[0] if queries else "")
+            absorb(found, title_query)
 
-        ordered = sorted(all_results.values(), key=lambda v: scores[v["key"]], reverse=True)
-        filtered = [v for v in ordered if scores[v["key"]] >= 10] or ordered[:5]
-        return filtered[:25]
+        ordered = sorted(
+            all_results.values(),
+            key=lambda video: scores[video["key"]],
+            reverse=True,
+        )
+        # Limite mais baixo evita que resultados apenas vagamente relacionados
+        # apareçam antes de títulos corretos.
+        filtered = [video for video in ordered if scores[video["key"]] >= 18]
+        return filtered[:ARVIO_MAX_RESULTS]
     finally:
         try:
             await client.disconnect()
         except Exception:
             pass
 
-
-def _search_telegram_multi(session: str, queries: list[str], imdb_id: str = "") -> list[dict]:
+def _search_telegram_multi(session: str, queries: list[str], imdb_id: str = "",
+                           selected_sources: list[str] | None = None) -> list[dict]:
     return _run_sync(
-        lambda: _search_async(session, queries, imdb_id),
+        lambda: _search_async(session, queries, imdb_id, selected_sources),
         timeout=TELEGRAM_SEARCH_TIMEOUT_S + 60,
     )
 
@@ -1114,6 +1309,80 @@ def twofa_start():
 
 
 # ==================================================================
+# Gerenciador de grupos e canais
+# ==================================================================
+@_app.route("/configure/sources", methods=["GET"])
+def configure_sources_list():
+    token = request.args.get("token", "")
+    token_data = _token_data(token)
+    session = token_data.get("s") if token_data else None
+    if not session:
+        return jsonify({"success": False, "error": "not_connected"}), 401
+
+    try:
+        sources = _run_sync(
+            lambda: _list_sources_async(session),
+            timeout=TELEGRAM_SEARCH_TIMEOUT_S + 45,
+        )
+        selected = token_data.get("sources") if "sources" in token_data else None
+        for source in sources:
+            source["selected"] = (
+                True if selected is None else source["id"] in set(map(str, selected))
+            )
+        return jsonify({
+            "success": True,
+            "sources": sources,
+            "selected_count": len(sources) if selected is None else len(
+                set(map(str, selected)) & {item["id"] for item in sources}
+            ),
+            "selection_mode": "all" if selected is None else "custom",
+        })
+    except Exception as exc:
+        print(f"[arvio] listagem de fontes falhou: {exc}")
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@_app.route("/configure/sources/save", methods=["POST"])
+def configure_sources_save():
+    data = request.get_json(silent=True) or {}
+    token = str(data.get("token") or "")
+    token_data = _token_data(token)
+    session = token_data.get("s") if token_data else None
+    if not session:
+        return jsonify({"success": False, "error": "not_connected"}), 401
+
+    requested = data.get("sources")
+    if not isinstance(requested, list):
+        return jsonify({"success": False, "error": "Lista de fontes inválida."}), 400
+    requested = list(dict.fromkeys(str(value) for value in requested if value is not None))
+
+    try:
+        available = _run_sync(
+            lambda: _list_sources_async(session),
+            timeout=TELEGRAM_SEARCH_TIMEOUT_S + 45,
+        )
+        available_ids = {item["id"] for item in available}
+        selected = sorted(set(requested) & available_ids)
+
+        # A seleção fica dentro do token criptografado; não exige banco de
+        # dados nem grava a sessão Telegram no armazenamento do servidor.
+        new_token = _token_for(session, {"sources": selected})
+        manifest_url = (
+            f"{_base_url()}/manifest.json?token={urllib.parse.quote(new_token)}"
+        )
+        return jsonify({
+            "success": True,
+            "manifest_url": manifest_url,
+            "selected_count": len(selected),
+            "available_count": len(available_ids),
+            "ignored_count": len(set(requested) - available_ids),
+        })
+    except Exception as exc:
+        print(f"[arvio] salvamento de fontes falhou: {exc}")
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+# ==================================================================
 # Configure page
 # ==================================================================
 @_app.route("/configure")
@@ -1125,6 +1394,7 @@ def configure():
             TEMPLATE_CONNECTED,
             manifest_url=f"{_base_url()}/manifest.json?token={urllib.parse.quote(token)}",
             base_url=_base_url(),
+            token=token,
         )
     return render_template_string(TEMPLATE_DISCONNECTED, base_url=_base_url())
 
@@ -1410,11 +1680,54 @@ h1{color:#e94560;text-align:center;margin:0 0 20px;font-size:28px}
 .step{background:rgba(15,15,26,.4);padding:14px;border-radius:10px;
   margin-bottom:16px;font-size:13px;color:#aaa;border-left:3px solid #e94560}
 .step strong{color:#eee;display:block;margin-bottom:4px}
+.source-panel{background:rgba(15,15,26,.45);border:1px solid rgba(255,255,255,.08);
+  border-radius:12px;padding:16px;margin:22px 0;text-align:left}
+.source-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.source-head strong{color:#eee;font-size:15px}
+.source-actions{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+.source-actions button{border:1px solid rgba(255,255,255,.12);background:#18233b;color:#ddd;
+  padding:8px 11px;border-radius:8px;cursor:pointer;font-size:12px}
+.source-actions button:hover{border-color:#e94560}
+.source-search{width:100%;padding:11px 12px;border-radius:8px;
+  border:1px solid rgba(255,255,255,.12);background:#0f0f1a;color:#eee;margin:8px 0 10px}
+.source-list{max-height:310px;overflow:auto;display:flex;flex-direction:column;gap:7px}
+.source-item{display:flex;align-items:center;gap:10px;padding:9px 10px;
+  background:rgba(255,255,255,.035);border-radius:8px;font-size:13px;cursor:pointer}
+.source-item input{accent-color:#e94560;width:16px;height:16px;flex:0 0 auto}
+.source-meta{display:block;color:#888;font-size:11px}
+.source-count{color:#aaa;font-size:12px;margin-top:10px}
+.source-message{color:#aaa;font-size:12px;margin-top:10px;min-height:18px}
+.source-save{width:100%;margin-top:12px}
+@media(max-width:520px){.container{padding:22px}.btn-group .btn{width:100%}}
 </style></head><body>
 <div class="container">
   <a href="{{ base_url }}/" class="back">← Voltar</a>
   <h1>Conectado</h1>
   <div class="status connected">✓ Conta do Telegram conectada</div>
+
+  <section class="source-panel">
+    <div class="source-head">
+      <strong>Fontes do Telegram</strong>
+      <span id="sourceMode" class="source-meta">Carregando grupos e canais...</span>
+    </div>
+    <p class="source-meta" style="margin-top:5px">
+      Escolha em quais grupos, supergrupos e canais o Arvio Stream deve procurar.
+      Fontes privadas aparecem quando sua conta tem acesso a elas.
+    </p>
+    <input id="sourceSearch" class="source-search" type="search"
+      placeholder="Filtrar por nome..." oninput="renderSources()">
+    <div class="source-actions">
+      <button type="button" onclick="selectAllSources()">Selecionar todos</button>
+      <button type="button" onclick="clearSources()">Limpar seleção</button>
+      <button type="button" onclick="loadSources()">Atualizar lista</button>
+    </div>
+    <div id="sourceList" class="source-list"></div>
+    <div id="sourceCount" class="source-count"></div>
+    <div id="sourceMessage" class="source-message"></div>
+    <button type="button" class="btn source-save" id="saveSources"
+      onclick="saveSources()">Salvar fontes selecionadas</button>
+  </section>
+
   <div class="step"><strong>1. Copie a URL do manifest abaixo</strong>
     Sua sessão está criptografada no token — nada é salvo no servidor.</div>
   <div class="manifest-label">Manifest URL</div>
@@ -1429,6 +1742,112 @@ h1{color:#e94560;text-align:center;margin:0 0 20px;font-size:28px}
   </div>
 </div>
 <script>
+const ARVIO_TOKEN = {{ token|tojson }};
+let sourceItems = [];
+let selectedSourceIds = new Set();
+let currentManifestUrl = document.getElementById('murl').textContent.trim();
+
+function sourceMessage(message, isError){
+  const el=document.getElementById('sourceMessage');
+  el.textContent=message||'';
+  el.style.color=isError?'#ff8585':'#aaa';
+}
+function updateSourceCount(){
+  document.getElementById('sourceCount').textContent =
+    selectedSourceIds.size + ' fonte(s) selecionada(s) de ' + sourceItems.length;
+}
+function renderSources(){
+  const root=document.getElementById('sourceList');
+  const filter=(document.getElementById('sourceSearch').value||'').toLocaleLowerCase();
+  root.replaceChildren();
+  const visible=sourceItems.filter(item =>
+    (item.title+' '+item.type+' '+(item.username||'')).toLocaleLowerCase().includes(filter)
+  );
+  if(!visible.length){
+    const empty=document.createElement('div');
+    empty.className='source-meta';
+    empty.textContent=sourceItems.length?'Nenhuma fonte corresponde à pesquisa.':'Nenhuma fonte encontrada.';
+    root.appendChild(empty);
+  }
+  visible.forEach(item=>{
+    const label=document.createElement('label');
+    label.className='source-item';
+    const checkbox=document.createElement('input');
+    checkbox.type='checkbox';
+    checkbox.checked=selectedSourceIds.has(item.id);
+    checkbox.addEventListener('change',()=>{
+      if(checkbox.checked)selectedSourceIds.add(item.id);
+      else selectedSourceIds.delete(item.id);
+      updateSourceCount();
+    });
+    const text=document.createElement('span');
+    text.textContent=item.title;
+    const meta=document.createElement('small');
+    meta.className='source-meta';
+    meta.textContent=item.type+(item.username?' • @'+item.username:'');
+    text.appendChild(meta);
+    label.append(checkbox,text);
+    root.appendChild(label);
+  });
+  updateSourceCount();
+}
+async function loadSources(){
+  const mode=document.getElementById('sourceMode');
+  mode.textContent='Consultando Telegram...';
+  sourceMessage('');
+  document.getElementById('saveSources').disabled=true;
+  try{
+    const response=await fetch('{{ base_url }}/configure/sources?token='+
+      encodeURIComponent(ARVIO_TOKEN)+'&v='+Date.now(),{cache:'no-store'});
+    const data=await response.json();
+    if(!response.ok||!data.success)throw new Error(data.error||'Não foi possível listar as fontes.');
+    sourceItems=data.sources||[];
+    selectedSourceIds=new Set(sourceItems.filter(x=>x.selected).map(x=>x.id));
+    mode.textContent=sourceItems.length+' fontes disponíveis';
+    renderSources();
+    sourceMessage(data.selection_mode==='all'
+      ?'Todas as fontes estão selecionadas inicialmente. Ajuste e salve sua seleção.'
+      :'Seleção personalizada carregada.');
+  }catch(error){
+    mode.textContent='Falha ao carregar';
+    sourceMessage(error.message,true);
+  }finally{
+    document.getElementById('saveSources').disabled=false;
+  }
+}
+function selectAllSources(){
+  selectedSourceIds=new Set(sourceItems.map(item=>item.id));
+  renderSources();
+}
+function clearSources(){
+  selectedSourceIds.clear();
+  renderSources();
+}
+async function saveSources(){
+  const button=document.getElementById('saveSources');
+  button.disabled=true;
+  button.textContent='Salvando...';
+  sourceMessage('');
+  try{
+    const response=await fetch('{{ base_url }}/configure/sources/save',{
+      method:'POST',cache:'no-store',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({token:ARVIO_TOKEN,sources:Array.from(selectedSourceIds)})
+    });
+    const data=await response.json();
+    if(!response.ok||!data.success)throw new Error(data.error||'Falha ao salvar seleção.');
+    currentManifestUrl=data.manifest_url;
+    document.getElementById('murl').textContent=currentManifestUrl;
+    sourceMessage(data.selected_count+' fonte(s) salva(s). Use a nova URL do manifest no Stremio.');
+  }catch(error){
+    sourceMessage(error.message,true);
+  }finally{
+    button.disabled=false;
+    button.textContent='Salvar fontes selecionadas';
+  }
+}
+loadSources();
+
 function copyUrl(){
   navigator.clipboard.writeText(document.getElementById('murl').textContent)
     .then(()=>alert('URL copiada! Cole no Stremio.'))
