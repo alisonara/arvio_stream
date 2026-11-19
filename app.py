@@ -276,30 +276,30 @@ def _matches_requested_episode(video: dict, season_no: int, episode_no: int) -> 
     text = f"{video.get('fileName', '')} {video.get('caption', '')}"
     norm = _normalize_match_text(text)
 
-    # Padrões explícitos: S01E07, 1x07, E07, EP07, Episode 07 etc.
-    explicit = [
-        (r"(?<![a-z0-9])s(\d{1,2})\s*e(\d{1,3})(?!\d)", "season_episode"),
-        (r"(?<![a-z0-9])(\d{1,2})x(\d{1,3})(?!\d)", "season_episode"),
-        (r"(?<![a-z0-9])(?:episode|episodio|ep|e)\s*0*(\d{1,3})(?!\d)", "episode"),
-    ]
-    found_marker = False
-    for pattern, kind in explicit:
+    # Prioriza padrões com temporada explícita para não confundir, por exemplo,
+    # S02E07 com o episódio 07 da temporada 01.
+    season_patterns = (
+        r"(?<![a-z0-9])s(\d{1,2})\s*e\s*0*(\d{1,3})(?!\d)",
+        r"(?<![a-z0-9])(\d{1,2})x\s*0*(\d{1,3})(?!\d)",
+    )
+    season_marker_found = False
+    for pattern in season_patterns:
         for match in re.finditer(pattern, norm):
-            found_marker = True
-            if kind == "season_episode":
-                found_season, found_episode = map(int, match.groups())
-                if found_season == season_no and found_episode == episode_no:
-                    return True
-            elif int(match.group(1)) == episode_no:
+            season_marker_found = True
+            found_season, found_episode = map(int, match.groups())
+            if found_season == season_no and found_episode == episode_no:
                 return True
+    if season_marker_found:
+        return False
+
+    # Aceita marcadores sem temporada (E07, EP07, Episode 07) somente quando
+    # o nome não informa explicitamente outra temporada/episódio.
+    episode_only = r"(?<![a-z0-9])(?:episode|episodio|ep|e)\s*0*(\d{1,3})(?!\d)"
+    if re.search(episode_only, norm):
+        return any(int(m.group(1)) == episode_no for m in re.finditer(episode_only, norm))
 
     # Alguns uploads usam apenas o número do episódio no nome (ex.: "Série - 07").
-    # Só aceita o número isolado quando não há marcador explícito conflitante.
-    if not found_marker:
-        return bool(re.search(
-            rf"(?<![a-z0-9])0*{episode_no}(?![0-9])", norm
-        ))
-    return False
+    return bool(re.search(rf"(?<![a-z0-9])0*{episode_no}(?![0-9])", norm))
 
 
 
@@ -321,30 +321,56 @@ def streams_json(content_type: str, content_id: str):
     title = (meta or {}).get("name") or ""
     year = (meta or {}).get("year") or ""
     alt = (meta or {}).get("originalName") or ""
-    aliases = list(dict.fromkeys(x for x in (title, alt) if x))
+    meta_aliases = (meta or {}).get("aliases") or []
+    if isinstance(meta_aliases, str):
+        meta_aliases = [meta_aliases]
+    aliases = list(dict.fromkeys(
+        str(value).strip() for value in (title, alt, *meta_aliases)
+        if value and str(value).strip()
+    ))
 
-    queries = []
-    for t in aliases:
-        if year:
-            queries.append(f"{t} {year}")
-        queries.extend((t, t.replace(" ", ".")))
+    # A sigla ajuda em nomes longos (Two and a Half Men -> TAAHM). Mantemos
+    # também a forma pontuada usada em alguns nomes de arquivo.
+    acronyms = []
+    for alias in aliases:
+        words = _tokens(alias)
+        if len(words) >= 3:
+            acronym = "".join(word[0] for word in words)
+            if len(acronym) >= 3:
+                acronyms.extend((acronym, ".".join(acronym) + "."))
 
-    # O Stremio costuma enviar séries como tt123456:temporada:episódio.
-    # Acrescentar padrões comuns ajuda a localizar arquivos cujo nome não
-    # contém o título completo, mas contém SxxEyy ou 1x02.
     episode_parts = content_id.split(":")
+    season_no = episode_no = None
     if content_type == "series" and len(episode_parts) >= 3:
         try:
             season_no, episode_no = int(episode_parts[1]), int(episode_parts[2])
-            if 0 <= season_no <= 99 and 0 <= episode_no <= 999:
-                queries.extend((
-                    f"S{season_no:02d}E{episode_no:02d}",
-                    f"S{season_no}E{episode_no}",
-                    f"{season_no}x{episode_no:02d}",
-                ))
+            if not (0 <= season_no <= 99 and 0 <= episode_no <= 999):
+                season_no = episode_no = None
         except (TypeError, ValueError):
-            pass
+            season_no = episode_no = None
 
+    episode_tags = []
+    if season_no is not None:
+        episode_tags = list(dict.fromkeys((
+            f"S{season_no:02d}E{episode_no:02d}",
+            f"{season_no}x{episode_no:02d}",
+        )))
+
+    # As três primeiras consultas cobrem título+episódio, sigla+episódio e
+    # título simples. A sigla, como TAAHM, entra cedo no orçamento de chamadas.
+    queries = []
+    if episode_tags:
+        queries.extend(f"{alias} {episode_tags[0]}" for alias in aliases)
+        queries.extend(f"{acronym} {episode_tags[0]}" for acronym in acronyms)
+    queries.extend(aliases)
+    queries.extend(acronyms)
+    for alias in aliases:
+        if year:
+            queries.append(f"{alias} {year}")
+        queries.extend(f"{alias} {tag}" for tag in episode_tags[1:])
+    for acronym in acronyms:
+        queries.extend(f"{acronym} {tag}" for tag in episode_tags[1:])
+    queries.extend(episode_tags)
     queries = [q for q in dict.fromkeys(queries) if q.strip()]
     if not queries:
         queries = [imdb_id]
@@ -649,6 +675,11 @@ def _score(video: dict, query: str, imdb_id: str) -> int:
         score += 120
     if q and q in blob:
         score += 45
+    # TAAHM também deve corresponder a T.A.A.H.M.
+    if len(q_tokens) == 1 and len(q_tokens[0]) >= 3:
+        compact_blob = re.sub(r"[^a-z0-9]", "", blob)
+        if q_tokens[0] in compact_blob:
+            score += 38
 
     hits = sum(1 for token in q_tokens if token in blob_tokens)
     coverage = hits / max(1, len(q_tokens))
@@ -921,14 +952,16 @@ async def _search_async(session: str, queries: list[str], imdb_id: str,
                     scores[key] = 0
                 scores[key] = max(scores[key], _score(video, query, imdb_id))
 
-        # Pesquisa global do Telegram primeiro; depois busca local em cada
-        # fonte selecionada, e por fim varre o histórico recente de documentos.
-        for query in queries[:6]:
-            found = await _search_global(client, query, scope)
-            absorb(found, query)
+        # Sem uma seleção salva, usa a busca global como fallback. Com uma
+        # seleção explícita, consulta somente os diálogos escolhidos para que
+        # o escopo reduzido também reduza o trabalho no Telegram.
+        if selected_sources is None:
+            for query in queries[:3]:
+                found = await _search_global(client, query, scope)
+                absorb(found, query)
 
-        if len(all_results) < 8:
-            for query in queries[:4]:
+        if selected_sources is not None or len(all_results) < 8:
+            for query in queries[:3]:
                 found = await _search_per_dialog(client, query, scope)
                 absorb(found, query)
 
@@ -958,12 +991,43 @@ async def _search_async(session: str, queries: list[str], imdb_id: str,
         except Exception:
             pass
 
+_SEARCH_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_SEARCH_CACHE_LOCK = threading.Lock()
+_SEARCH_CACHE_TTL = max(0, int(os.environ.get("ARVIO_SEARCH_CACHE_TTL", 60)))
+_SEARCH_CACHE_MAX = 128
+
+
 def _search_telegram_multi(session: str, queries: list[str], imdb_id: str = "",
                            selected_sources: list[str] | None = None) -> list[dict]:
-    return _run_sync(
+    # O Stremio pode repetir a mesma consulta. Um cache curto reduz tráfego e
+    # latência durante a vida da instância. A chave nunca guarda sessão aberta.
+    key_data = json.dumps({
+        "session": hashlib.sha256(session.encode()).hexdigest(),
+        "queries": queries,
+        "imdb": imdb_id,
+        "sources": sorted(map(str, selected_sources)) if selected_sources is not None else None,
+    }, sort_keys=True, separators=(",", ":"))
+    cache_key = hashlib.sha256(key_data.encode()).hexdigest()
+    now = time.monotonic()
+    if _SEARCH_CACHE_TTL:
+        with _SEARCH_CACHE_LOCK:
+            cached = _SEARCH_CACHE.get(cache_key)
+            if cached and now - cached[0] < _SEARCH_CACHE_TTL:
+                return list(cached[1])
+            if cached:
+                _SEARCH_CACHE.pop(cache_key, None)
+
+    result = _run_sync(
         lambda: _search_async(session, queries, imdb_id, selected_sources),
         timeout=TELEGRAM_SEARCH_TIMEOUT_S + 60,
     )
+    if _SEARCH_CACHE_TTL:
+        with _SEARCH_CACHE_LOCK:
+            if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
+                oldest = min(_SEARCH_CACHE, key=lambda key: _SEARCH_CACHE[key][0])
+                _SEARCH_CACHE.pop(oldest, None)
+            _SEARCH_CACHE[cache_key] = (time.monotonic(), list(result))
+    return result
 
 
 # ==================================================================
