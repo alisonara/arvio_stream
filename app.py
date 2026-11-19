@@ -75,8 +75,8 @@ if _TELETHON_OK:
             pass
 
 # ---------- Credenciais ----------
-TELEGRAM_API_ID = 23905496
-TELEGRAM_API_HASH = "1e48b355edfe55f9a4fbf8d3c2324628"
+TELEGRAM_API_ID = int(os.environ.get("TELEGRAM_API_ID", 0))
+TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
 TELEGRAM_SEARCH_TIMEOUT_S = 20
 
 MT_CHUNK = 256 * 1024
