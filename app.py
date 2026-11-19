@@ -271,6 +271,38 @@ def manifest():
     })
 
 
+def _matches_requested_episode(video: dict, season_no: int, episode_no: int) -> bool:
+    """Mantém somente arquivos identificáveis como o episódio solicitado."""
+    text = f"{video.get('fileName', '')} {video.get('caption', '')}"
+    norm = _normalize_match_text(text)
+
+    # Padrões explícitos: S01E07, 1x07, E07, EP07, Episode 07 etc.
+    explicit = [
+        (r"(?<![a-z0-9])s(\d{1,2})\s*e(\d{1,3})(?!\d)", "season_episode"),
+        (r"(?<![a-z0-9])(\d{1,2})x(\d{1,3})(?!\d)", "season_episode"),
+        (r"(?<![a-z0-9])(?:episode|episodio|ep|e)\s*0*(\d{1,3})(?!\d)", "episode"),
+    ]
+    found_marker = False
+    for pattern, kind in explicit:
+        for match in re.finditer(pattern, norm):
+            found_marker = True
+            if kind == "season_episode":
+                found_season, found_episode = map(int, match.groups())
+                if found_season == season_no and found_episode == episode_no:
+                    return True
+            elif int(match.group(1)) == episode_no:
+                return True
+
+    # Alguns uploads usam apenas o número do episódio no nome (ex.: "Série - 07").
+    # Só aceita o número isolado quando não há marcador explícito conflitante.
+    if not found_marker:
+        return bool(re.search(
+            rf"(?<![a-z0-9])0*{episode_no}(?![0-9])", norm
+        ))
+    return False
+
+
+
 @_app.route("/stream/<content_type>/<content_id>.json")
 def streams_json(content_type: str, content_id: str):
     token = request.args.get("token")
@@ -326,6 +358,17 @@ def streams_json(content_type: str, content_id: str):
             session, queries, imdb_id=imdb_id,
             selected_sources=selected_sources,
         )
+        # Para séries, não misturar episódios vizinhos encontrados pela busca
+        # ampla do título. Exige que o arquivo/caption identifique o episódio.
+        if content_type == "series" and len(episode_parts) >= 3:
+            try:
+                season_no, episode_no = int(episode_parts[1]), int(episode_parts[2])
+                videos = [
+                    video for video in videos
+                    if _matches_requested_episode(video, season_no, episode_no)
+                ]
+            except (TypeError, ValueError):
+                pass
     except Exception as e:
         print(f"[arvio] busca falhou: {e}")
         return jsonify({"streams": [], "error": str(e)}), 500
