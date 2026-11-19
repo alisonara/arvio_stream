@@ -276,40 +276,46 @@ def _matches_requested_episode(video: dict, season_no: int, episode_no: int) -> 
     text = f"{video.get('fileName', '')} {video.get('caption', '')}"
     norm = _normalize_match_text(text)
 
-    # Prioriza padrões com temporada explícita para não confundir, por exemplo,
-    # S02E07 com o episódio 07 da temporada 01.
-    season_patterns = (
-        r"(?<![a-z0-9])s(\d{1,2})\s*e\s*0*(\d{1,3})(?!\d)",
-        r"(?<![a-z0-9])(\d{1,2})x\s*0*(\d{1,3})(?!\d)",
+    # Formas comuns: S01E02, S01 EP02, 1x02, T1E2, Season 1 Episode 2,
+    # Temporada 1 Episódio 2 e Episode 2 Season 1. A normalização anterior
+    # converte pontos, sublinhados e hífens em espaços.
+    patterns = (
+        r"(?<![a-z0-9])s\s*0*(\d{1,2})\s*e(?:p(?:isode|isodio)?)?\s*0*(\d{1,3})(?!\d)",
+        r"(?<![a-z0-9])t\s*0*(\d{1,2})\s*e(?:p)?\s*0*(\d{1,3})(?!\d)",
+        r"(?<![a-z0-9])(\d{1,2})\s*x\s*0*(\d{1,3})(?!\d)",
+        r"\b(?:season|temporada|temp)\s*0*(\d{1,2})\b.{0,35}?\b(?:episode|episodio|epis|ep|e)\s*0*(\d{1,3})\b",
+        r"\b(?:episode|episodio|epis|ep)\s*0*(\d{1,3})\b.{0,35}?\b(?:season|temporada|temp)\s*0*(\d{1,2})\b",
     )
-    season_marker_found = False
-    for pattern in season_patterns:
+    found_explicit_marker = False
+    for index, pattern in enumerate(patterns):
         for match in re.finditer(pattern, norm):
-            season_marker_found = True
-            found_season, found_episode = map(int, match.groups())
+            found_explicit_marker = True
+            first, second = map(int, match.groups())
+            found_season, found_episode = (
+                (second, first) if index == 4 else (first, second)
+            )
             if found_season == season_no and found_episode == episode_no:
                 return True
-    if season_marker_found:
+    if found_explicit_marker:
         return False
 
-    # Aceita marcadores sem temporada (E07, EP07, Episode 07) somente quando
-    # o nome não informa explicitamente outra temporada/episódio.
-    episode_only = r"(?<![a-z0-9])(?:episode|episodio|ep|e)\s*0*(\d{1,3})(?!\d)"
+    # Mantém a compatibilidade com uploads antigos que não incluem temporada
+    # e só identificam o episódio (E02, EP02, Episode 02 ou número isolado).
+    episode_only = r"(?<![a-z0-9])(?:episode|episodio|epis|ep|e)\s*0*(\d{1,3})(?!\d)"
     if re.search(episode_only, norm):
         return any(int(m.group(1)) == episode_no for m in re.finditer(episode_only, norm))
-
-    # Alguns uploads usam apenas o número do episódio no nome (ex.: "Série - 07").
     return bool(re.search(rf"(?<![a-z0-9])0*{episode_no}(?![0-9])", norm))
 
 
 def _matches_requested_title(video: dict, aliases: list[str]) -> bool:
-    """Exige evidência do título para não misturar séries com mesmo SxxEyy."""
+    """Aceita título completo, palavras-chave ou sigla no nome ou legenda."""
     if not aliases:
         return True
     text = f"{video.get('fileName', '')} {video.get('caption', '')}"
     norm = _normalize_match_text(text)
-    blob_tokens = set(_tokens(text))
-    compact_blob = re.sub(r"[^a-z0-9]", "", norm)
+    blob_words = norm.split()
+    blob_tokens = set(blob_words)
+    compact_blob = "".join(blob_words)
     stopwords = {
         "the", "a", "an", "and", "of", "to", "la", "el", "los", "las",
         "as", "os", "de", "da", "do", "dos", "das", "e",
@@ -317,17 +323,36 @@ def _matches_requested_title(video: dict, aliases: list[str]) -> bool:
 
     for alias in aliases:
         alias_norm = _normalize_match_text(alias)
-        alias_tokens = [token for token in _tokens(alias) if token not in stopwords]
-        if not alias_tokens:
+        alias_words = alias_norm.split()
+        if not alias_words:
             continue
-        if all(token in blob_tokens for token in alias_tokens):
+        if f" {alias_norm} " in f" {norm} ":
             return True
 
-        # Permite a sigla mesmo quando o arquivo usa pontos entre as letras.
-        if len(alias_tokens) >= 3:
-            acronym = "".join(token[0] for token in alias_tokens)
-            if len(acronym) >= 3 and acronym in compact_blob:
+        # Aceita títulos colados, como TheAmericans, além de iniciais com ou
+        # sem pontuação: Two and a Half Men, TAAHM e T.A.A.H.M.
+        compact_alias = "".join(alias_words)
+        if len(compact_alias) >= 5 and compact_alias in compact_blob:
+            return True
+
+        meaningful = [word for word in alias_words if word not in stopwords]
+        if meaningful:
+            hits = sum(word in blob_tokens for word in meaningful)
+            needed = 1 if len(meaningful) == 1 else max(2, (len(meaningful) + 1) // 2)
+            if hits >= needed:
                 return True
+
+        initials = [word[0] for word in alias_words if word]
+        meaningful_initials = [word[0] for word in meaningful if word]
+        for letters in (initials, meaningful_initials):
+            acronym = "".join(letters)
+            if len(acronym) < 3:
+                continue
+            if acronym in blob_tokens:
+                return True
+            for start in range(max(0, len(blob_words) - len(letters) + 1)):
+                if blob_words[start:start + len(letters)] == letters:
+                    return True
     return False
 
 
@@ -362,7 +387,7 @@ def streams_json(content_type: str, content_id: str):
     # também a forma pontuada usada em alguns nomes de arquivo.
     acronyms = []
     for alias in aliases:
-        words = _tokens(alias)
+        words = re.findall(r"[a-z0-9]+", _normalize_match_text(alias))
         if len(words) >= 3:
             acronym = "".join(word[0] for word in words)
             if len(acronym) >= 3:
@@ -385,13 +410,16 @@ def streams_json(content_type: str, content_id: str):
             f"{season_no}x{episode_no:02d}",
         )))
 
-    # As três primeiras consultas cobrem título+episódio, sigla+episódio e
-    # título simples. A sigla, como TAAHM, entra cedo no orçamento de chamadas.
+    # Mantém consultas em cada idioma do Cinemeta, com grafia original,
+    # separadores alternativos e siglas antes das consultas mais genéricas.
     queries = []
     if episode_tags:
         queries.extend(f"{alias} {episode_tags[0]}" for alias in aliases)
-        queries.extend(f"{acronym} {episode_tags[0]}" for acronym in acronyms)
     queries.extend(aliases)
+    if episode_tags:
+        queries.extend(f"{acronym} {episode_tags[0]}" for acronym in acronyms)
+    for alias in aliases:
+        queries.append(alias.replace(" ", "."))
     queries.extend(acronyms)
     for alias in aliases:
         if year:
@@ -429,18 +457,9 @@ def streams_json(content_type: str, content_id: str):
         print(f"[arvio] busca falhou: {e}")
         return jsonify({"streams": [], "error": str(e)}), 500
 
+    videos = videos[:ARVIO_MAX_RESULTS]
     streams = []
-    seen_files = set()
     for v in videos:
-        # Uma cópia repostada em vários grupos não precisa aparecer várias
-        # vezes na mesma lista do Stremio.
-        file_key = (
-            _normalize_match_text(v.get("fileName", "")),
-            int(v.get("size") or 0),
-        )
-        if file_key in seen_files:
-            continue
-        seen_files.add(file_key)
         play_payload = {
             "s": session,
             "p": v["peerId"],
@@ -992,16 +1011,14 @@ async def _search_async(session: str, queries: list[str], imdb_id: str,
                     scores[key] = 0
                 scores[key] = max(scores[key], _score(video, query, imdb_id))
 
-        # Sem uma seleção salva, usa a busca global como fallback. Com uma
-        # seleção explícita, consulta somente os diálogos escolhidos para que
-        # o escopo reduzido também reduza o trabalho no Telegram.
-        if selected_sources is None:
-            for query in queries[:3]:
-                found = await _search_global(client, query, scope)
-                absorb(found, query)
+        # Preserva a busca global do Telegram, filtrando o retorno para as
+        # fontes selecionadas quando existe uma seleção salva.
+        for query in queries[:6]:
+            found = await _search_global(client, query, scope)
+            absorb(found, query)
 
-        if selected_sources is not None or len(all_results) < 8:
-            for query in queries[:3]:
+        if len(all_results) < 8:
+            for query in queries[:4]:
                 found = await _search_per_dialog(client, query, scope)
                 absorb(found, query)
 
@@ -1024,7 +1041,10 @@ async def _search_async(session: str, queries: list[str], imdb_id: str,
         # Limite mais baixo evita que resultados apenas vagamente relacionados
         # apareçam antes de títulos corretos.
         filtered = [video for video in ordered if scores[video["key"]] >= 18]
-        return filtered[:ARVIO_MAX_RESULTS]
+        # A filtragem final de título/episódio acontece na rota Stremio. Guarda
+        # uma margem aqui para resultados globais vagos não expulsarem os
+        # arquivos corretos antes dessa validação.
+        return filtered[:ARVIO_MAX_RESULTS * 5]
     finally:
         try:
             await client.disconnect()
