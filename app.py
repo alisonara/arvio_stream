@@ -440,6 +440,9 @@ def streams_json(content_type: str, content_id: str):
         videos = _search_telegram_multi(
             session, queries, imdb_id=imdb_id,
             selected_sources=selected_sources,
+            search_aliases=aliases,
+            season_no=season_no,
+            episode_no=episode_no,
         )
         # Para séries, não misturar episódios vizinhos encontrados pela busca
         # ampla do título. Exige que o arquivo/caption identifique o episódio.
@@ -759,13 +762,28 @@ def _score(video: dict, query: str, imdb_id: str) -> int:
     if years and any(year in blob for year in years):
         score += 12
 
-    # Reforço de padrões de temporada/episódio (S01E02, 1x02).
+    # Reforço de temporada/episódio somente quando o título ou a sigla também
+    # aparece. Um S01E01 isolado não deve elevar qualquer série no ranking.
     episode_patterns = re.findall(r"\bs\d{1,2}\s*e\d{1,3}\b|\b\d{1,2}x\d{1,3}\b", q)
     if episode_patterns and any(
         re.sub(r"\s+", "", pat) in re.sub(r"\s+", "", blob)
         for pat in episode_patterns
     ):
-        score += 35
+        title_query_tokens = [
+            token for token in q_tokens
+            if not re.fullmatch(r"s\d{1,2}e\d{1,3}|\d{1,2}x\d{1,3}", token)
+        ]
+        title_hits = sum(token in blob_tokens for token in title_query_tokens)
+        compact_title_query = "".join(title_query_tokens)
+        title_match = bool(
+            title_query_tokens
+            and title_hits >= max(1, (len(title_query_tokens) + 1) // 2)
+        )
+        if compact_title_query and len(compact_title_query) >= 3:
+            compact_blob = re.sub(r"[^a-z0-9]", "", blob)
+            title_match = title_match or compact_title_query in compact_blob
+        if title_match:
+            score += 35
 
     if video.get("duration", 0) > 0:
         score += 2
@@ -981,7 +999,10 @@ async def _search_by_filename(client, tokens: list[str], scope: dict,
 
 
 async def _search_async(session: str, queries: list[str], imdb_id: str,
-                        selected_sources: list[str] | None = None) -> list[dict]:
+                        selected_sources: list[str] | None = None,
+                        search_aliases: list[str] | None = None,
+                        season_no: int | None = None,
+                        episode_no: int | None = None) -> list[dict]:
     client = _new_client(session)
     try:
         await client.connect()
@@ -1011,13 +1032,24 @@ async def _search_async(session: str, queries: list[str], imdb_id: str,
                     scores[key] = 0
                 scores[key] = max(scores[key], _score(video, query, imdb_id))
 
+        def exact_episode_found() -> bool:
+            if season_no is None or episode_no is None:
+                return False
+            return any(
+                _matches_requested_title(video, search_aliases or [])
+                and _matches_requested_episode(video, season_no, episode_no)
+                for video in all_results.values()
+            )
+
         # Preserva a busca global do Telegram, filtrando o retorno para as
         # fontes selecionadas quando existe uma seleção salva.
         for query in queries[:6]:
             found = await _search_global(client, query, scope)
             absorb(found, query)
 
-        if len(all_results) < 8:
+        if len(all_results) < 8 or (
+            season_no is not None and not exact_episode_found()
+        ):
             for query in queries[:4]:
                 found = await _search_per_dialog(client, query, scope)
                 absorb(found, query)
@@ -1029,7 +1061,10 @@ async def _search_async(session: str, queries: list[str], imdb_id: str,
             queries[0] if queries else "",
         )
         tokens = _tokens(title_query)
-        if tokens and len(all_results) < 20:
+        if tokens and (
+            len(all_results) < 20
+            or (season_no is not None and not exact_episode_found())
+        ):
             found = await _search_by_filename(client, tokens, scope)
             absorb(found, title_query)
 
@@ -1040,7 +1075,15 @@ async def _search_async(session: str, queries: list[str], imdb_id: str,
         )
         # Limite mais baixo evita que resultados apenas vagamente relacionados
         # apareçam antes de títulos corretos.
-        filtered = [video for video in ordered if scores[video["key"]] >= 18]
+        filtered = [
+            video for video in ordered
+            if scores[video["key"]] >= 18
+            or (
+                season_no is not None and episode_no is not None
+                and _matches_requested_title(video, search_aliases or [])
+                and _matches_requested_episode(video, season_no, episode_no)
+            )
+        ]
         # A filtragem final de título/episódio acontece na rota Stremio. Guarda
         # uma margem aqui para resultados globais vagos não expulsarem os
         # arquivos corretos antes dessa validação.
@@ -1058,7 +1101,10 @@ _SEARCH_CACHE_MAX = 128
 
 
 def _search_telegram_multi(session: str, queries: list[str], imdb_id: str = "",
-                           selected_sources: list[str] | None = None) -> list[dict]:
+                           selected_sources: list[str] | None = None,
+                           search_aliases: list[str] | None = None,
+                           season_no: int | None = None,
+                           episode_no: int | None = None) -> list[dict]:
     # O Stremio pode repetir a mesma consulta. Um cache curto reduz tráfego e
     # latência durante a vida da instância. A chave nunca guarda sessão aberta.
     key_data = json.dumps({
@@ -1066,6 +1112,9 @@ def _search_telegram_multi(session: str, queries: list[str], imdb_id: str = "",
         "queries": queries,
         "imdb": imdb_id,
         "sources": sorted(map(str, selected_sources)) if selected_sources is not None else None,
+        "aliases": search_aliases or [],
+        "season": season_no,
+        "episode": episode_no,
     }, sort_keys=True, separators=(",", ":"))
     cache_key = hashlib.sha256(key_data.encode()).hexdigest()
     now = time.monotonic()
@@ -1078,7 +1127,10 @@ def _search_telegram_multi(session: str, queries: list[str], imdb_id: str = "",
                 _SEARCH_CACHE.pop(cache_key, None)
 
     result = _run_sync(
-        lambda: _search_async(session, queries, imdb_id, selected_sources),
+        lambda: _search_async(
+            session, queries, imdb_id, selected_sources,
+            search_aliases, season_no, episode_no,
+        ),
         timeout=TELEGRAM_SEARCH_TIMEOUT_S + 60,
     )
     if _SEARCH_CACHE_TTL:
